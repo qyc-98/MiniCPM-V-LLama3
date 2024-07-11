@@ -21,7 +21,7 @@ from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from dataset import SupervisedDataset, data_collator
 from trainer import CPMTrainer
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-
+from model_llama3 import MiniCPMV
 
 #############################
 # Training & Model Arguments
@@ -237,10 +237,6 @@ def train():
             logging.warning(
                 "FSDP or ZeRO3 are not incompatible with QLoRA."
             )
-    if training_args.llm_type == "llama3":
-        from model_llama3 import MiniCPMV
-    elif training_args.llm_type == "minicpm":
-        from model_minicpm import MiniCPMV
         
     model = MiniCPMV.from_pretrained(
         model_args.model_name_or_path,
