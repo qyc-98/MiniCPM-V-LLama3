@@ -2,6 +2,22 @@
 
 We offer the official scripts for easy finetuning of the pretrained **MiniCPM-Llama3-V 2.5** and **MiniCPM-V 2.0** on downstream tasks. Our finetune scripts use transformers Trainer and DeepSpeed by default.
 
+
+### GUICourse Summary ###
+
+GUICourse is a group of complete datasets to train visual-based GUI agents from general VLMs, through improving VLMs' fundamental abilities and GUI knowledge. GUICourse is composed of three datasets: 
+
+(1) GUIEnv, a large-scale dataset for improving VLMs' OCR and grounding abilities, including 10M website page-annotation pairs as pre-training data and 0.7M region-text QA pairs as SFT data; 
+![example1](./assets/GUIEnv-example.svg)
+
+(2) GUIAct, a GUI navigation dataset in website and Android scenarios for enhancing VLMs' knowledge of GUI systems, including 67k single-step and 15k multi-step action instructions. 
+![example2](./assets/GUIAct-example.svg)
+
+(3) GUIChat, a conversational dataset for improving the interaction skills of GUI agents, including 44k single-turn QA pairs and 6k multi-turn dialogues with text-rich images and bounding boxes.
+![example3](./assets/GUIChat-example.svg)
+
+
+
 ### Data preparation
 
 To prepare your finetuning data, you should formulate each sample as a dictionary consisting of an id, an image path list with an image, and a list of conversations. Then save data samples in JSON files.
@@ -48,6 +64,27 @@ For the vision-language example with image, you are required to provide **\<imag
 ```
 
 </details>
+
+For GUICourse dataset, please refer to [GUICourse](https://github.com/qyc-98/GUICourse/tree/main?tab=readme-ov-file#download) to preprocess your data.
+
+```shell
+#download data
+git clone https://github.com/qyc-98/GUICourse.git
+cd GUICourse
+
+mkdir data
+mkdir images
+
+git lfs install
+git clone https://huggingface.co/datasets/yiye2023/GUIChat
+git clone https://huggingface.co/datasets/yiye2023/GUIAct
+git clone https://huggingface.co/datasets/yiye2023/GUIEnv
+
+mv GUIChat/* data/
+mv GUIAct/* data/
+mv GUIEnv/* data/
+
+```
 
 ### Full-parameter finetuning
 
