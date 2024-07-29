@@ -79,7 +79,7 @@ class MiniCPMV(MiniCPMVPreTrainedModel):
             for pixel_values in pixel_values_list:
                 img_cnt.append(len(pixel_values))
                 all_pixel_values.extend([i.flatten(end_dim=1).permute(1, 0) for i in pixel_values])
-
+            
             # exist image
             if all_pixel_values:
                 tgt_sizes = torch.vstack(tgt_sizes).type(torch.int32)
@@ -107,6 +107,7 @@ class MiniCPMV(MiniCPMVPreTrainedModel):
                         single_pixel_values = single_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
                         single_vision_embedding = self.vpm(single_pixel_values.type(dtype)).last_hidden_state
                         single_vision_embedding = self.resampler(single_vision_embedding, single_tgt_size.unsqueeze(0))
+                        
                         vision_embedding.append(single_vision_embedding)
                     vision_embedding = torch.vstack(vision_embedding)
 
@@ -160,96 +161,7 @@ class MiniCPMV(MiniCPMVPreTrainedModel):
         return vllm_embedding, vision_hidden_states
         
     def forward(self, data, **kwargs):
-        if 'vision_hidden_states' not in data:
-            dtype = self.llm.lm_head.weight.dtype
-            device = self.llm.lm_head.weight.device
-            tgt_sizes = data['tgt_sizes']
-            pixel_values_list = data['pixel_values']
-            vision_hidden_states = []
-            all_pixel_values = []
-            img_cnt = []
-            for pixel_values in pixel_values_list:
-                img_cnt.append(len(pixel_values))
-                all_pixel_values.extend([i.flatten(end_dim=1).permute(1, 0) for i in pixel_values])
-
-            # exist image
-            if all_pixel_values:
-                tgt_sizes = torch.vstack(tgt_sizes).type(torch.int32)
-
-                if self.config.batch_vision_input:
-                    max_patches = torch.max(tgt_sizes[:, 0] * tgt_sizes[:, 1])
-
-                    all_pixel_values = torch.nn.utils.rnn.pad_sequence(all_pixel_values, batch_first=True,
-                                                                       padding_value=0.0)
-                    B, L, _ = all_pixel_values.shape
-                    all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
-
-                    patch_attn_mask = torch.zeros((B, 1, max_patches), dtype=torch.bool, device=device)
-                    for i in range(B):
-                        patch_attn_mask[i, :tgt_sizes[i][0] * tgt_sizes[i][1]] = True
-
-                    vision_embedding = self.vpm(all_pixel_values.type(dtype), patch_attention_mask=patch_attn_mask).last_hidden_state
-                    vision_embedding = self.resampler(vision_embedding, tgt_sizes)
-                else:
-                    # get vision_embedding foreach
-                    vision_embedding = []
-                    for single_tgt_size, single_pixel_values in zip(tgt_sizes, all_pixel_values):
-                        single_pixel_values = single_pixel_values.unsqueeze(0)
-                        B, L, _ = single_pixel_values.shape
-                        single_pixel_values = single_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
-                        single_vision_embedding = self.vpm(single_pixel_values.type(dtype)).last_hidden_state
-                        single_vision_embedding = self.resampler(single_vision_embedding, single_tgt_size.unsqueeze(0))
-                        vision_embedding.append(single_vision_embedding)
-                    vision_embedding = torch.vstack(vision_embedding)
-
-                start = 0
-                for pixel_values in pixel_values_list:
-                    img_cnt = len(pixel_values)
-                    if img_cnt > 0:
-                        vision_hidden_states.append(vision_embedding[start: start + img_cnt])
-                        start += img_cnt
-                    else:
-                        vision_hidden_states.append([])
-            else: # no image
-                if self.training:
-                    dummy_image = torch.zeros(
-                        (1, 3, 224, 224),
-                        device=device, dtype=dtype
-                    )
-                    tgt_sizes = torch.Tensor([[(224 // self.config.patch_size), math.ceil(224 / self.config.patch_size)]]).type(torch.int32)
-                    dummy_feature = self.resampler(self.vpm(dummy_image).last_hidden_state, tgt_sizes)
-                else:
-                    dummy_feature = []
-                for _ in range(len(pixel_values_list)):
-                    vision_hidden_states.append(dummy_feature)
-
-        else:
-            vision_hidden_states = data['vision_hidden_states']
-
-        if hasattr(self.llm.config, 'scale_emb'):
-            vllm_embedding = self.llm.model.embed_tokens(data['input_ids']) * self.llm.config.scale_emb
-        else:
-            vllm_embedding = self.llm.model.embed_tokens(data['input_ids'])
-
-        vision_hidden_states = [i.type(vllm_embedding.dtype) if isinstance(
-            i, torch.Tensor) else i for i in vision_hidden_states]
-
-        bs = len(data['input_ids'])
-        for i in range(bs):
-            cur_vs_hs = vision_hidden_states[i]
-            if len(cur_vs_hs) > 0:
-                cur_vllm_emb = vllm_embedding[i]
-                cur_image_bound = data['image_bound'][i]
-                if len(cur_image_bound) > 0:
-                    image_indices = torch.stack(
-                        [torch.arange(r[0], r[1], dtype=torch.long) for r in cur_image_bound]
-                    ).to(vllm_embedding.device)
-                    cur_vllm_emb.scatter_(0, image_indices.view(-1, 1).repeat(1, cur_vllm_emb.shape[-1]),
-                                          cur_vs_hs.view(-1, cur_vs_hs.shape[-1]))
-                elif self.training:
-                    cur_vllm_emb += cur_vs_hs[0].mean() * 0
-
-        # vllm_embedding, vision_hidden_states = self.get_vllm_embedding(data)
+        vllm_embedding, vision_hidden_states = self.get_vllm_embedding(data)
         position_ids = data["position_ids"]
         if position_ids.dtype != torch.int64:
             position_ids = position_ids.long()
@@ -297,11 +209,20 @@ class MiniCPMV(MiniCPMVPreTrainedModel):
             )
         padded = {}
         for key in pad_keys:
-            padded[key] = pad(input_tensors, key, padding_side="left").to(self.device)
-        padded["image_bound"] = [i["image_bound"] for i in input_tensors]
+            if len(input_tensors) > 1:
+                padded[key], padding_length = pad(input_tensors, key, padding_side="left", device=self.device)
+            else:
+                padded[key] = pad(input_tensors, key, padding_side="left", ).to(self.device)
+                padding_length = [0 for _ in padded[key]]
+        padded["image_bound"] = []
+        for item, length in zip(input_tensors, padding_length):
+            image_bound = length + item["image_bound"]
+            padded["image_bound"].append(image_bound)
+        padded['attention_mask'] = padded['input_ids'].ne(0)
+
         return padded
 
-    def _decode(self, inputs_embeds, tokenizer, **kwargs):
+    def _decode(self, inputs_embeds, tokenizer, attention_mask, **kwargs):
         terminators = [
             tokenizer.eos_token_id,
             tokenizer.convert_tokens_to_ids("<|eot_id|>")
@@ -310,6 +231,7 @@ class MiniCPMV(MiniCPMVPreTrainedModel):
             inputs_embeds=inputs_embeds,
             pad_token_id=0,
             eos_token_id=terminators,
+            attention_mask=attention_mask,
             **kwargs
         )
         return self._decode_text(output, tokenizer)
@@ -444,7 +366,7 @@ class MiniCPMV(MiniCPMVPreTrainedModel):
             if stream:
                 result = self._decode_stream(model_inputs["inputs_embeds"], tokenizer, **kwargs)
             else:
-                result = self._decode(model_inputs["inputs_embeds"], tokenizer, **kwargs)
+                result = self._decode(model_inputs["inputs_embeds"], tokenizer, model_inputs['attention_mask'],**kwargs)
 
         if return_vision_hidden_states:
             return result, vision_hidden_states
@@ -453,8 +375,8 @@ class MiniCPMV(MiniCPMVPreTrainedModel):
 
     def chat(
         self,
-        image,
-        msgs,
+        images_list,
+        msgs_list,
         tokenizer,
         vision_hidden_states=None,
         max_new_tokens=1024,
@@ -464,61 +386,69 @@ class MiniCPMV(MiniCPMVPreTrainedModel):
         stream=False,
         **kwargs
     ):
-        if isinstance(msgs, str):
-            msgs = json.loads(msgs)
-
-        copy_msgs = deepcopy(msgs)
-        assert len(copy_msgs) > 0, 'msgs is empty'
-        assert sampling or not stream, 'if use stream mode, make sure sampling=True'
-
-        if image is not None and isinstance(copy_msgs[0]['content'], str):
-            copy_msgs[0]['content'] = [image, copy_msgs[0]['content']]
-
-        images = []
-        tgt_sizes = []
-        for i, msg in enumerate(copy_msgs):
-            role = msg["role"]
-            content = msg["content"]
-            assert role in ["user", "assistant"]
-            if i == 0:
-                assert role == "user", "The role of first msg should be user"
-            if isinstance(content, str):
-                content = [content]
-
-            cur_msgs = []
-            for c in content:
-                if isinstance(c, Image.Image):
-                    image = c
-                    if self.config.slice_mode:
-                        slice_images, image_placeholder = self.get_slice_image_placeholder(
-                            image, tokenizer
-                        )
-                        cur_msgs.append(image_placeholder)
-                        for slice_image in slice_images:
-                            slice_image = self.transform(slice_image)
-                            H, W = slice_image.shape[1:]
-                            images.append(self.reshape_by_patch(slice_image))
-                            tgt_sizes.append(torch.Tensor([H // self.config.patch_size, W // self.config.patch_size]).type(torch.int32))
-                    else:
-                        images.append(self.transform(image))
-                        cur_msgs.append(
-                            tokenizer.im_start
-                            + tokenizer.unk_token * self.config.query_num
-                            + tokenizer.im_end
-                        )
-                elif isinstance(c, str):
-                    cur_msgs.append(c)
-
-
-            msg['content'] = '\n'.join(cur_msgs)
-        if tgt_sizes:
-            tgt_sizes = torch.vstack(tgt_sizes)
-
-        if system_prompt:
-            sys_msg = {'role': 'system', 'content': system_prompt}
-            copy_msgs = [sys_msg] + copy_msgs
-
-        input_ids = tokenizer.apply_chat_template(copy_msgs, tokenize=True, add_generation_prompt=False)
+        input_ids_list = []
+        input_img_list = []
+        tgt_sizes_list = []
+        for image, msgs in zip(images_list, msgs_list):
+            if isinstance(msgs, str):
+                msgs = json.loads(msgs)
+    
+            copy_msgs = deepcopy(msgs)
+            assert len(copy_msgs) > 0, 'msgs is empty'
+            assert sampling or not stream, 'if use stream mode, make sure sampling=True'
+    
+            if image is not None and isinstance(copy_msgs[0]['content'], str):
+                copy_msgs[0]['content'] = [image, copy_msgs[0]['content']]
+    
+            images = []
+            tgt_sizes = []
+            for i, msg in enumerate(copy_msgs):
+                role = msg["role"]
+                content = msg["content"]
+                assert role in ["user", "assistant"]
+                if i == 0:
+                    assert role == "user", "The role of first msg should be user"
+                if isinstance(content, str):
+                    content = [content]
+    
+                cur_msgs = []
+                for c in content:
+                    if isinstance(c, Image.Image):
+                        image = c
+                        if self.config.slice_mode:
+                            slice_images, image_placeholder = self.get_slice_image_placeholder(
+                                image, tokenizer
+                            )
+                            cur_msgs.append(image_placeholder)
+                            for slice_image in slice_images:
+                                slice_image = self.transform(slice_image)
+                                H, W = slice_image.shape[1:]
+                                images.append(self.reshape_by_patch(slice_image))
+                                tgt_sizes.append(torch.Tensor([H // self.config.patch_size, W // self.config.patch_size]).type(torch.int32))
+                        else:
+                            images.append(self.transform(image))
+                            cur_msgs.append(
+                                tokenizer.im_start
+                                + tokenizer.unk_token * self.config.query_num
+                                + tokenizer.im_end
+                            )
+                    elif isinstance(c, str):
+                        cur_msgs.append(c)
+    
+    
+                msg['content'] = '\n'.join(cur_msgs)
+            if tgt_sizes:
+                tgt_sizes = torch.vstack(tgt_sizes)
+    
+            if system_prompt:
+                sys_msg = {'role': 'system', 'content': system_prompt}
+                copy_msgs = [sys_msg] + copy_msgs
+    
+            input_ids = tokenizer.apply_chat_template(copy_msgs, tokenize=True, add_generation_prompt=False)
+            input_img_list.append(images)
+            input_ids_list.append(input_ids)
+            tgt_sizes_list.append(tgt_sizes)
+            
 
         if sampling:
             generation_config = {
@@ -540,10 +470,10 @@ class MiniCPMV(MiniCPMVPreTrainedModel):
 
         with torch.inference_mode():
             res, vision_hidden_states = self.generate(
-                input_id_list=[input_ids],
+                input_id_list=input_ids_list,
                 max_inp_length=max_inp_length,
-                img_list=[images],
-                tgt_sizes=[tgt_sizes],
+                img_list=input_img_list,
+                tgt_sizes=tgt_sizes_list,
                 tokenizer=tokenizer,
                 max_new_tokens=max_new_tokens,
                 vision_hidden_states=vision_hidden_states,
@@ -560,7 +490,8 @@ class MiniCPMV(MiniCPMVPreTrainedModel):
             return stream_gen()
 
         else:
-            answer = res[0]
+            answer = res
+            # answer = res[0]
             return answer
 
 
@@ -612,7 +543,7 @@ class PreTrainedTokenizerFastWrapper(PreTrainedTokenizerFast):
         return text
 
 
-def pad(orig_items, key, max_length=None, padding_value=0, padding_side="left"):
+def pad(orig_items, key, max_length=None, padding_value=0, padding_side="left", device=None):
     items = []
     if isinstance(orig_items[0][key], list):
         assert isinstance(orig_items[0][key][0], torch.Tensor)
@@ -634,7 +565,7 @@ def pad(orig_items, key, max_length=None, padding_value=0, padding_side="left"):
     dtype = items[0][key].dtype
 
     if dim == 1:
-        return torch.cat([item[key] for item in items], dim=0)
+        return torch.cat([item[key] for item in items], dim=0), [0]
     elif dim == 2:
         if max_length == min_length:
             return torch.cat([item[key] for item in items], dim=0)
@@ -644,7 +575,7 @@ def pad(orig_items, key, max_length=None, padding_value=0, padding_side="left"):
             torch.zeros((batch_size, max_length, shape[-1]), dtype=dtype)
             + padding_value
         )
-
+    padding_length = []
     for i, item in enumerate(items):
         if dim == 2:
             if padding_side == "left":
@@ -656,8 +587,11 @@ def pad(orig_items, key, max_length=None, padding_value=0, padding_side="left"):
                 tensor[i, -len(item[key][0]) :, :] = item[key][0].clone()
             else:
                 tensor[i, : len(item[key][0]), :] = item[key][0].clone()
+        padding_length.append(
+            tensor.shape[-1] - len(item[key][0])
+        )
 
-    return tensor
+    return tensor.to(device), padding_length
 
 
 def slice_image(
